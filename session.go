@@ -107,6 +107,27 @@ func (s *Session) SetServerVersion(major, minor uint8) {
 	s.serverVersionMinor = minor
 }
 
+// IsVersion2OrHigher 返回服务器是否支持 HiSLIP 2.0 或更高版本。
+// HiSLIP 2.0 增加了 TLS 加密、SASL 认证等功能。
+func (s *Session) IsVersion2OrHigher() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.serverVersionMajor >= 2
+}
+
+// VersionAtLeast 检查服务器版本是否至少为指定版本。
+func (s *Session) VersionAtLeast(major, minor uint8) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.serverVersionMajor > major {
+		return true
+	}
+	if s.serverVersionMajor == major && s.serverVersionMinor >= minor {
+		return true
+	}
+	return false
+}
+
 // NextMessageID 返回下一个消息 ID 并递增计数器。
 // 根据规范 3.1.2：从 0xffffff00 开始，每次加 2。
 func (s *Session) NextMessageID() uint32 {

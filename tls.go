@@ -175,3 +175,137 @@ func (c *Client) TLSConnectionState() *tls.ConnectionState {
 	}
 	return nil
 }
+
+// ================ SASL 认证框架 (HiSLIP 2.0) ================
+
+// GetSASLMechanisms 获取服务器支持的 SASL 认证机制列表。
+// 仅在 HiSLIP 2.0 或更高版本中可用。
+func (c *Client) GetSASLMechanisms(ctx context.Context) ([]string, error) {
+	if !c.session.IsVersion2OrHigher() {
+		return nil, fmt.Errorf("SASL authentication requires HiSLIP 2.0 or higher")
+	}
+
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return nil, ErrClosed
+	}
+	c.mu.RUnlock()
+
+	// 发送 GetSaslMechanismList
+	if err := c.syncConn.SendMessage(MsgGetSaslMechanismList, 0, 0, nil); err != nil {
+		return nil, fmt.Errorf("send GetSaslMechanismList: %w", err)
+	}
+
+	// 等待响应
+	msg, err := c.syncConn.ExpectMessage(MsgGetSaslMechanismListResponse, c.config.Timeout)
+	if err != nil {
+		return nil, fmt.Errorf("wait GetSaslMechanismListResponse: %w", err)
+	}
+
+	// 解析机制列表（以空格分隔的字符串）
+	if len(msg.Payload) == 0 {
+		return nil, nil
+	}
+
+	mechanisms := splitSASLMechanisms(string(msg.Payload))
+	return mechanisms, nil
+}
+
+// splitSASLMechanisms 解析 SASL 机制列表字符串
+func splitSASLMechanisms(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var mechanisms []string
+	for _, m := range splitBySpace(s) {
+		if m != "" {
+			mechanisms = append(mechanisms, m)
+		}
+	}
+	return mechanisms
+}
+
+// splitBySpace 按空格分割字符串
+func splitBySpace(s string) []string {
+	var result []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == ' ' {
+			if start < i {
+				result = append(result, s[start:i])
+			}
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		result = append(result, s[start:])
+	}
+	return result
+}
+
+// Authenticate 使用指定的 SASL 机制进行认证。
+// 仅在 HiSLIP 2.0 或更高版本中可用。
+// 注意：这是一个基础框架，具体的 SASL 机制实现需要根据需求添加。
+func (c *Client) Authenticate(ctx context.Context, mechanism string, credentials []byte) error {
+	if !c.session.IsVersion2OrHigher() {
+		return fmt.Errorf("SASL authentication requires HiSLIP 2.0 or higher")
+	}
+
+	if !c.session.IsEncrypted() {
+		return fmt.Errorf("SASL authentication requires encrypted connection")
+	}
+
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return ErrClosed
+	}
+	c.mu.RUnlock()
+
+	// 发送 AuthenticationStart
+	// 控制码: 0
+	// 参数: 0
+	// 负载: 机制名称
+	if err := c.syncConn.SendMessage(MsgAuthenticationStart, 0, 0, []byte(mechanism)); err != nil {
+		return fmt.Errorf("send AuthenticationStart: %w", err)
+	}
+
+	// 认证交换循环
+	for {
+		msg, err := c.syncConn.ReadWithTimeout(c.config.Timeout)
+		if err != nil {
+			return fmt.Errorf("authentication exchange: %w", err)
+		}
+
+		switch msg.Header.MsgType {
+		case MsgAuthenticationExchange:
+			// 服务器请求更多数据，发送凭据
+			if err := c.syncConn.SendMessage(MsgAuthenticationExchange, 0, 0, credentials); err != nil {
+				return fmt.Errorf("send AuthenticationExchange: %w", err)
+			}
+
+		case MsgAuthenticationResult:
+			switch msg.Header.Control {
+			case CtrlAuthSuccess:
+				return nil
+			case CtrlAuthFail:
+				return ErrAuthFailed
+			case CtrlAuthContinue:
+				// 继续认证流程
+				continue
+			default:
+				return fmt.Errorf("unexpected authentication result: ctrl=%d", msg.Header.Control)
+			}
+
+		case MsgFatalError:
+			return NewFatalError(msg.Header.Control, msg.Payload)
+
+		case MsgError:
+			return NewNonFatalError(msg.Header.Control, msg.Payload)
+
+		default:
+			return fmt.Errorf("unexpected message during authentication: %s", MsgTypeName(msg.Header.MsgType))
+		}
+	}
+}

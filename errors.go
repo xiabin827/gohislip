@@ -21,6 +21,7 @@ var (
 	ErrTLSRequired      = errors.New("hislip: TLS required but not established")
 	ErrAuthRequired     = errors.New("hislip: authentication required")
 	ErrAuthFailed       = errors.New("hislip: authentication failed")
+	ErrMessageTooLarge  = errors.New("hislip: message exceeds negotiated maximum size")
 )
 
 // 致命错误码（规范表 5）

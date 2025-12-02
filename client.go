@@ -69,13 +69,7 @@ type Client struct {
 	closed bool
 
 	// 用于同步模式查询处理
-	queryMu   sync.Mutex
-	queryResp chan queryResult
-}
-
-type queryResult struct {
-	data []byte
-	err  error
+	queryMu sync.Mutex
 }
 
 // NewClient 创建新的 HiSLIP 客户端，但尚未连接。
@@ -91,7 +85,6 @@ func NewClient(config *ClientConfig) *Client {
 		asyncDone: make(chan struct{}),
 		syncResp:  make(chan *Message, 16),
 		asyncResp: make(chan *Message, 16),
-		queryResp: make(chan queryResult, 1),
 	}
 }
 
@@ -187,7 +180,11 @@ func (c *Client) Connect(ctx context.Context, address string) error {
 	}
 
 	// 启动读取循环
-	go c.readLoopSync()
+	// 同步模式下不启动 syncReadLoop，避免与 Read/Query 竞争
+	// overlapped 模式下需要 readLoopSync 来分发响应
+	if c.session.Mode() == ModeOverlapped {
+		go c.readLoopSync()
+	}
 	go c.readLoopAsync()
 
 	c.log("connected, session ID: %d, version: %d.%d",
@@ -269,6 +266,12 @@ func (c *Client) recvInitializeResponse() error {
 	major, minor := ParseVersion(version)
 	c.session.SetServerVersion(major, minor)
 
+	// 协议版本兼容性检查
+	// HiSLIP 2.0 向后兼容 1.x，但某些功能仅在 2.0 可用
+	if major < 1 {
+		return fmt.Errorf("unsupported protocol version %d.%d (minimum 1.0)", major, minor)
+	}
+
 	// 解析参数: overlap | encryption_mode | session_id
 	overlap, encMode, sessionID := ParseInitializeResponseParam(msg.Header.Param)
 	c.session.SetSessionID(sessionID)
@@ -278,6 +281,12 @@ func (c *Client) recvInitializeResponse() error {
 	// 根据协商设置模式
 	if overlap && c.config.UseOverlappedMode {
 		c.session.SetMode(ModeOverlapped)
+	}
+
+	// 加密模式仅在 HiSLIP 2.0+ 中有效
+	if major < 2 && encMode != EncryptionModeNone {
+		c.log("warning: encryption mode in pre-2.0 server response, ignoring")
+		c.session.SetEncryptionMode(EncryptionModeNone)
 	}
 
 	c.log("InitializeResponse: version=%d.%d session=%d overlap=%v enc=%d",
@@ -308,27 +317,17 @@ func (c *Client) recvAsyncInitializeResponse() error {
 }
 
 // negotiateMaxMessageSize 协商最大消息大小。
+// 根据 HiSLIP 2.0 规范（IVI-6.1）第 4.6 节：
+// - AsyncMaximumMessageSize (消息类型 15): control=0, param=0, payload=8字节(64位大小，大端序)
+// - AsyncMaximumMessageSizeResponse (消息类型 16): control=0, param=0, payload=8字节(协商后的大小)
+// 注意：HiSLIP 1.x 也支持此消息，但返回的大小可能不同
 func (c *Client) negotiateMaxMessageSize() error {
-	// 发送我们首选的最大大小
+	// 构造 8 字节的负载（64 位最大消息大小，大端序）
 	maxSize := DefaultMaxMessageSize
-	param := uint32(maxSize >> 32)
+	payload := encodeUint64(maxSize)
 
-	msg := NewMessage(MsgAsyncMaximumMessageSize, 0, param, nil)
-	// 以特殊方式放置低 32 位或使用负载
-	// 实际上根据规范，64 位大小分布在参数和负载中
-	payload := make([]byte, 8)
-	payload[0] = byte(maxSize >> 56)
-	payload[1] = byte(maxSize >> 48)
-	payload[2] = byte(maxSize >> 40)
-	payload[3] = byte(maxSize >> 32)
-	payload[4] = byte(maxSize >> 24)
-	payload[5] = byte(maxSize >> 16)
-	payload[6] = byte(maxSize >> 8)
-	payload[7] = byte(maxSize)
-	msg.Header.Length = 8
-	msg.Payload = payload
-
-	if err := c.asyncConn.WriteMessage(msg); err != nil {
+	// 根据规范: control=0, param=0, payload 包含完整的 64 位值
+	if err := c.asyncConn.SendMessage(MsgAsyncMaximumMessageSize, 0, 0, payload); err != nil {
 		return err
 	}
 
@@ -338,22 +337,52 @@ func (c *Client) negotiateMaxMessageSize() error {
 		return err
 	}
 
-	// 解析服务器的最大大小
-	if len(resp.Payload) >= 8 {
-		serverMax := uint64(resp.Payload[0])<<56 |
-			uint64(resp.Payload[1])<<48 |
-			uint64(resp.Payload[2])<<40 |
-			uint64(resp.Payload[3])<<32 |
-			uint64(resp.Payload[4])<<24 |
-			uint64(resp.Payload[5])<<16 |
-			uint64(resp.Payload[6])<<8 |
-			uint64(resp.Payload[7])
-
-		c.session.SetMaxMessageSizeFromServer(serverMax)
-		c.log("negotiated max message size: %d bytes", serverMax)
+	// 解析服务器返回的协商大小
+	if len(resp.Payload) < 8 {
+		return fmt.Errorf("AsyncMaximumMessageSizeResponse payload too short: %d bytes", len(resp.Payload))
 	}
 
+	serverMax := decodeUint64(resp.Payload)
+
+	// 更新会话中的最大消息大小
+	// 实际使用时应取客户端和服务器的较小值
+	negotiatedSize := serverMax
+	if maxSize < serverMax {
+		negotiatedSize = maxSize
+	}
+
+	c.session.SetMaxMessageSizeFromServer(serverMax)
+	c.session.SetMaxMessageSizeToServer(negotiatedSize)
+	c.log("negotiated max message size: client=%d, server=%d, using=%d",
+		maxSize, serverMax, negotiatedSize)
+
 	return nil
+}
+
+// encodeUint64 将 uint64 编码为 8 字节大端序切片
+func encodeUint64(v uint64) []byte {
+	b := make([]byte, 8)
+	b[0] = byte(v >> 56)
+	b[1] = byte(v >> 48)
+	b[2] = byte(v >> 40)
+	b[3] = byte(v >> 32)
+	b[4] = byte(v >> 24)
+	b[5] = byte(v >> 16)
+	b[6] = byte(v >> 8)
+	b[7] = byte(v)
+	return b
+}
+
+// decodeUint64 从 8 字节大端序切片解码 uint64
+func decodeUint64(b []byte) uint64 {
+	return uint64(b[0])<<56 |
+		uint64(b[1])<<48 |
+		uint64(b[2])<<40 |
+		uint64(b[3])<<32 |
+		uint64(b[4])<<24 |
+		uint64(b[5])<<16 |
+		uint64(b[6])<<8 |
+		uint64(b[7])
 }
 
 // Write 向仪器发送 SCPI 命令。
@@ -374,6 +403,12 @@ func (c *Client) WriteBytes(data []byte) error {
 		return ErrDeviceClear
 	}
 
+	// 检查消息大小是否超过协商的最大值
+	maxSize := c.session.MaxMessageSizeToServer()
+	if uint64(len(data)) > maxSize {
+		return fmt.Errorf("%w: payload %d bytes exceeds max %d", ErrMessageTooLarge, len(data), maxSize)
+	}
+
 	// 获取下一个消息 ID
 	msgID := c.session.NextMessageID()
 
@@ -383,7 +418,14 @@ func (c *Client) WriteBytes(data []byte) error {
 	c.log("Write: msgID=0x%08x len=%d", msgID, len(data))
 
 	// 发送 DataEnd（完整消息）
-	return c.syncConn.SendMessage(MsgDataEnd, ctrl, msgID, data)
+	if err := c.syncConn.SendMessage(MsgDataEnd, ctrl, msgID, data); err != nil {
+		return err
+	}
+
+	// 记录最后发送的消息 ID，用于 Interrupted 逻辑和状态查询
+	c.session.SetLastSentID(msgID)
+	c.session.SetPendingResponse(true)
+	return nil
 }
 
 // Read 从仪器读取响应数据。
@@ -392,6 +434,7 @@ func (c *Client) Read() ([]byte, error) {
 }
 
 // ReadWithTimeout 使用自定义超时读取响应。
+// 同步模式下直接从连接读取，overlapped 模式下从 syncResp 通道读取。
 func (c *Client) ReadWithTimeout(timeout time.Duration) ([]byte, error) {
 	c.mu.RLock()
 	if c.closed {
@@ -400,19 +443,37 @@ func (c *Client) ReadWithTimeout(timeout time.Duration) ([]byte, error) {
 	}
 	c.mu.RUnlock()
 
+	if c.session.Mode() == ModeOverlapped {
+		return c.readOverlapped(timeout)
+	}
+	return c.readSynchronized(timeout)
+}
+
+// readSynchronized 在同步模式下直接从连接读取响应。
+func (c *Client) readSynchronized(timeout time.Duration) ([]byte, error) {
 	var result bytes.Buffer
 	deadline := time.Now().Add(timeout)
+	maxSize := c.session.MaxMessageSizeFromServer()
 
 	for {
 		// 设置读取截止时间
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
+			c.session.SetPendingResponse(false)
 			return nil, ErrTimeout
 		}
 
 		msg, err := c.syncConn.ReadWithTimeout(remaining)
 		if err != nil {
+			c.session.SetPendingResponse(false)
 			return nil, err
+		}
+
+		// 检查接收消息大小是否超过协商的最大值
+		if msg.Header.Length > maxSize {
+			c.session.SetPendingResponse(false)
+			c.log("received message exceeds max size: %d > %d", msg.Header.Length, maxSize)
+			return nil, fmt.Errorf("%w: received %d bytes, max %d", ErrMessageTooLarge, msg.Header.Length, maxSize)
 		}
 
 		// 处理不同的消息类型
@@ -426,22 +487,84 @@ func (c *Client) ReadWithTimeout(timeout time.Duration) ([]byte, error) {
 			// 最终数据段
 			result.Write(msg.Payload)
 			c.session.SetLastRecvID(msg.Header.Param)
+			c.session.SetPendingResponse(false)
 			c.log("Read complete: msgID=0x%08x len=%d", msg.Header.Param, result.Len())
 			return result.Bytes(), nil
 
 		case MsgFatalError:
+			c.session.SetPendingResponse(false)
 			return nil, NewFatalError(msg.Header.Control, msg.Payload)
 
 		case MsgError:
+			c.session.SetPendingResponse(false)
 			return nil, NewNonFatalError(msg.Header.Control, msg.Payload)
 
 		case MsgInterrupted:
 			// 清除缓冲区并返回错误
 			c.log("Interrupted received")
+			c.session.SetPendingResponse(false)
 			return nil, ErrInterrupted
 
 		default:
 			c.log("unexpected message type during read: %s", MsgTypeName(msg.Header.MsgType))
+		}
+	}
+}
+
+// readOverlapped 在 overlapped 模式下从 syncResp 通道读取响应。
+func (c *Client) readOverlapped(timeout time.Duration) ([]byte, error) {
+	var result bytes.Buffer
+	deadline := time.Now().Add(timeout)
+	maxSize := c.session.MaxMessageSizeFromServer()
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			c.session.SetPendingResponse(false)
+			return nil, ErrTimeout
+		}
+
+		select {
+		case msg := <-c.syncResp:
+			// 检查接收消息大小是否超过协商的最大值
+			if msg.Header.Length > maxSize {
+				c.session.SetPendingResponse(false)
+				c.log("received message exceeds max size: %d > %d", msg.Header.Length, maxSize)
+				return nil, fmt.Errorf("%w: received %d bytes, max %d", ErrMessageTooLarge, msg.Header.Length, maxSize)
+			}
+
+			switch msg.Header.MsgType {
+			case MsgData:
+				result.Write(msg.Payload)
+				c.session.SetLastRecvID(msg.Header.Param)
+
+			case MsgDataEnd:
+				result.Write(msg.Payload)
+				c.session.SetLastRecvID(msg.Header.Param)
+				c.session.SetPendingResponse(false)
+				c.log("Read complete: msgID=0x%08x len=%d", msg.Header.Param, result.Len())
+				return result.Bytes(), nil
+
+			case MsgFatalError:
+				c.session.SetPendingResponse(false)
+				return nil, NewFatalError(msg.Header.Control, msg.Payload)
+
+			case MsgError:
+				c.session.SetPendingResponse(false)
+				return nil, NewNonFatalError(msg.Header.Control, msg.Payload)
+
+			case MsgInterrupted:
+				c.log("Interrupted received")
+				c.session.SetPendingResponse(false)
+				return nil, ErrInterrupted
+
+			default:
+				c.log("unexpected message type during read: %s", MsgTypeName(msg.Header.MsgType))
+			}
+
+		case <-time.After(remaining):
+			c.session.SetPendingResponse(false)
+			return nil, ErrTimeout
 		}
 	}
 }
@@ -479,6 +602,16 @@ func (c *Client) querySynchronized(cmd []byte) ([]byte, error) {
 
 // queryOverlapped 在 overlapped 模式下处理查询。
 func (c *Client) queryOverlapped(cmd []byte) ([]byte, error) {
+	if c.session.IsClearInProgress() {
+		return nil, ErrDeviceClear
+	}
+
+	// 检查消息大小是否超过协商的最大值
+	maxSize := c.session.MaxMessageSizeToServer()
+	if uint64(len(cmd)) > maxSize {
+		return nil, fmt.Errorf("%w: payload %d bytes exceeds max %d", ErrMessageTooLarge, len(cmd), maxSize)
+	}
+
 	// 在 overlapped 模式下，可以有多个待处理查询
 	msgID := c.session.NextMessageID()
 
@@ -492,12 +625,18 @@ func (c *Client) queryOverlapped(cmd []byte) ([]byte, error) {
 		return nil, err
 	}
 
+	// 记录最后发送的消息 ID
+	c.session.SetLastSentID(msgID)
+	c.session.SetPendingResponse(true)
+
 	// Wait for response
 	select {
 	case <-pq.done:
+		c.session.SetPendingResponse(false)
 		return pq.response, pq.err
 	case <-time.After(c.config.Timeout):
 		c.tracker.Complete(msgID, nil, ErrTimeout)
+		c.session.SetPendingResponse(false)
 		return nil, ErrTimeout
 	}
 }
@@ -703,11 +842,23 @@ func (c *Client) Trigger() error {
 	}
 	c.mu.RUnlock()
 
+	if c.session.IsClearInProgress() {
+		return ErrDeviceClear
+	}
+
 	msgID := c.session.NextMessageID()
 	ctrl := uint8(CtrlRMTDelivered)
 
 	c.log("Trigger: msgID=0x%08x", msgID)
-	return c.syncConn.SendMessage(MsgTrigger, ctrl, msgID, nil)
+
+	if err := c.syncConn.SendMessage(MsgTrigger, ctrl, msgID, nil); err != nil {
+		return err
+	}
+
+	// 记录最后发送的消息 ID
+	c.session.SetLastSentID(msgID)
+	// Trigger 不期望响应，不设置 PendingResponse
+	return nil
 }
 
 // RemoteLocal 发送远程/本地控制命令。
