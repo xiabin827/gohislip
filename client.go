@@ -60,6 +60,9 @@ type Client struct {
 	syncResp  chan *Message
 	asyncResp chan *Message
 
+	// 专用操作通道
+	deviceClearAck chan struct{} // DeviceClear 异步确认
+
 	// SRQ（服务请求）回调
 	srqCallback func(stb byte)
 	srqMu       sync.Mutex
@@ -78,13 +81,14 @@ func NewClient(config *ClientConfig) *Client {
 		config = DefaultConfig()
 	}
 	return &Client{
-		session:   NewSession(),
-		tracker:   NewQueryTracker(),
-		config:    config,
-		syncDone:  make(chan struct{}),
-		asyncDone: make(chan struct{}),
-		syncResp:  make(chan *Message, 16),
-		asyncResp: make(chan *Message, 16),
+		session:        NewSession(),
+		tracker:        NewQueryTracker(),
+		config:         config,
+		syncDone:       make(chan struct{}),
+		asyncDone:      make(chan struct{}),
+		syncResp:       make(chan *Message, 16),
+		asyncResp:      make(chan *Message, 16),
+		deviceClearAck: make(chan struct{}, 1),
 	}
 }
 
@@ -766,45 +770,60 @@ func (c *Client) DeviceClear(ctx context.Context) error {
 
 	c.log("DeviceClear starting")
 
+	// 清空可能残留的确认信号
+	select {
+	case <-c.deviceClearAck:
+	default:
+	}
+
 	// 步骤 1：在异步通道上发送 AsyncDeviceClear
 	if err := c.asyncConn.SendMessage(MsgAsyncDeviceClear, 0, 0, nil); err != nil {
 		return fmt.Errorf("send AsyncDeviceClear: %w", err)
 	}
 
 	// 步骤 2：等待 AsyncDeviceClearAcknowledge
-	// 注意：需要处理清除期间可能到达的消息
-	deadline := time.Now().Add(c.config.Timeout)
-	for {
-		if time.Now().After(deadline) {
-			return ErrTimeout
-		}
-
-		msg, err := c.asyncConn.ReadWithTimeout(time.Until(deadline))
-		if err != nil {
-			return fmt.Errorf("wait AsyncDeviceClearAcknowledge: %w", err)
-		}
-
-		if msg.Header.MsgType == MsgAsyncDeviceClear {
-			// 这是确认（相同的消息类型，只是响应）
-			c.log("AsyncDeviceClearAcknowledge received")
-			break
-		}
-		if msg.Header.MsgType == MsgFatalError {
-			return NewFatalError(msg.Header.Control, msg.Payload)
-		}
-		// 清除期间丢弃其他消息
-		c.log("discarding message during clear: %s", MsgTypeName(msg.Header.MsgType))
+	// 确认消息由 readLoopAsync -> dispatchAsync 接收并发送到 deviceClearAck
+	select {
+	case <-c.deviceClearAck:
+		c.log("AsyncDeviceClearAcknowledge received")
+	case <-time.After(c.config.Timeout):
+		return ErrTimeout
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 
 	// 步骤 3：清除本地缓冲区 - 丢弃待处理响应
 	c.tracker.Clear(ErrDeviceClear)
 
-	// 步骤 4：在同步通道上发送 DeviceClearComplete
+	// 步骤 4 & 5：同步通道上的 DeviceClearComplete/Acknowledge
+	// 在 overlapped 模式下，syncConn 由 readLoopSync 读取，需要通过 syncResp 等待
+	if c.session.Mode() == ModeOverlapped {
+		if err := c.deviceClearSyncOverlapped(ctx); err != nil {
+			return err
+		}
+	} else {
+		if err := c.deviceClearSyncDirect(ctx); err != nil {
+			return err
+		}
+	}
+
+	// 步骤 6：重置会话状态
+	c.session.Reset()
+
+	c.log("DeviceClear complete")
+	return nil
+}
+
+// deviceClearSyncDirect 在同步模式下直接处理同步通道清除
+func (c *Client) deviceClearSyncDirect(ctx context.Context) error {
+	deadline := time.Now().Add(c.config.Timeout)
+
+	// 发送 DeviceClearComplete
 	if err := c.syncConn.SendMessage(MsgDeviceClearComplete, 0, 0, nil); err != nil {
 		return fmt.Errorf("send DeviceClearComplete: %w", err)
 	}
 
-	// 步骤 5：等待 DeviceClearAcknowledge
+	// 等待 DeviceClearAcknowledge
 	for {
 		if time.Now().After(deadline) {
 			return ErrTimeout
@@ -817,20 +836,48 @@ func (c *Client) DeviceClear(ctx context.Context) error {
 
 		if msg.Header.MsgType == MsgDeviceClearAcknowledge {
 			c.log("DeviceClearAcknowledge received")
-			break
+			return nil
 		}
 		if msg.Header.MsgType == MsgFatalError {
 			return NewFatalError(msg.Header.Control, msg.Payload)
 		}
-		// Discard other messages
+		// 清除期间丢弃其他消息
 		c.log("discarding message during clear: %s", MsgTypeName(msg.Header.MsgType))
 	}
+}
 
-	// 步骤 6：重置会话状态
-	c.session.Reset()
+// deviceClearSyncOverlapped 在 overlapped 模式下通过 syncResp 等待同步通道清除确认
+func (c *Client) deviceClearSyncOverlapped(ctx context.Context) error {
+	// 发送 DeviceClearComplete
+	if err := c.syncConn.SendMessage(MsgDeviceClearComplete, 0, 0, nil); err != nil {
+		return fmt.Errorf("send DeviceClearComplete: %w", err)
+	}
 
-	c.log("DeviceClear complete")
-	return nil
+	// 等待 DeviceClearAcknowledge 通过 syncResp（由 dispatchSync 处理）
+	deadline := time.Now().Add(c.config.Timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ErrTimeout
+		}
+
+		select {
+		case msg := <-c.syncResp:
+			if msg.Header.MsgType == MsgDeviceClearAcknowledge {
+				c.log("DeviceClearAcknowledge received")
+				return nil
+			}
+			if msg.Header.MsgType == MsgFatalError {
+				return NewFatalError(msg.Header.Control, msg.Payload)
+			}
+			// 清除期间丢弃其他消息
+			c.log("discarding message during clear: %s", MsgTypeName(msg.Header.MsgType))
+		case <-time.After(remaining):
+			return ErrTimeout
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // Trigger 向仪器发送触发消息。
@@ -945,23 +992,23 @@ func (c *Client) dispatchSync(msg *Message) {
 
 	switch msg.Header.MsgType {
 	case MsgData, MsgDataEnd:
-		// 在 overlapped 模式下路由到待处理查询
+		// 在 overlapped 模式下，先尝试路由到待处理查询
 		if c.session.IsOverlapped() {
 			msgID := msg.Header.Param
 			if pq, ok := c.tracker.Get(msgID); ok {
-				// 累积数据
+				// 累积数据到查询跟踪器
 				pq.response = append(pq.response, msg.Payload...)
 				if msg.Header.MsgType == MsgDataEnd {
 					c.tracker.Complete(msgID, pq.response, nil)
 				}
+				return
 			}
-		} else {
-			// 在同步模式下，转发到读取通道
-			select {
-			case c.syncResp <- msg:
-			default:
-				c.log("sync response channel full")
-			}
+		}
+
+		select {
+		case c.syncResp <- msg:
+		default:
+			c.log("sync response channel full")
 		}
 
 	case MsgInterrupted:
@@ -980,7 +1027,12 @@ func (c *Client) dispatchSync(msg *Message) {
 		c.log("Error: %v", err)
 
 	case MsgDeviceClearAcknowledge:
-		// 在 DeviceClear 方法中处理
+		// 在 overlapped 模式下转发到 syncResp 供 DeviceClear 等待
+		select {
+		case c.syncResp <- msg:
+		default:
+			c.log("sync response channel full for DeviceClearAcknowledge")
+		}
 
 	default:
 		c.log("unhandled sync message: %s", MsgTypeName(msg.Header.MsgType))
@@ -1006,6 +1058,15 @@ func (c *Client) dispatchAsync(msg *Message) {
 	case MsgAsyncInterrupted:
 		c.log("AsyncInterrupted received")
 		c.tracker.Clear(ErrInterrupted)
+
+	case MsgAsyncDeviceClear:
+		// AsyncDeviceClearAcknowledge - 通知等待的 DeviceClear
+		c.log("AsyncDeviceClearAcknowledge received via dispatch")
+		select {
+		case c.deviceClearAck <- struct{}{}:
+		default:
+			// 没有等待者，忽略
+		}
 
 	case MsgFatalError:
 		err := NewFatalError(msg.Header.Control, msg.Payload)

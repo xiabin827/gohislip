@@ -6,7 +6,17 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
+	"time"
 )
+
+// mergeDeadline 计算操作截止时间，取 context deadline 和配置超时的较早者。
+func mergeDeadline(ctx context.Context, timeout time.Duration) time.Time {
+	deadline := time.Now().Add(timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		return ctxDeadline
+	}
+	return deadline
+}
 
 // TLSConfig 提供创建 TLS 配置的辅助函数。
 
@@ -83,6 +93,10 @@ func NewTLSConfigFull(serverName, caCertPath, certPath, keyPath string) (*tls.Co
 // StartTLS 将现有的非加密连接升级为 TLS。
 // 遵循 HiSLIP 2.0 StartTLS 序列。
 func (c *Client) StartTLS(ctx context.Context) error {
+	if c.session.Mode() == ModeOverlapped {
+		return fmt.Errorf("StartTLS cannot be called in overlapped mode; use TLS config during Connect")
+	}
+
 	if c.session.IsEncrypted() {
 		return fmt.Errorf("already encrypted")
 	}
@@ -97,11 +111,28 @@ func (c *Client) StartTLS(ctx context.Context) error {
 // EndTLS 从 TLS 降级为非加密连接。
 // 很少使用但在 HiSLIP 2.0 中有规定。
 func (c *Client) EndTLS(ctx context.Context) error {
+	if c.session.Mode() == ModeOverlapped {
+		return fmt.Errorf("EndTLS cannot be called in overlapped mode")
+	}
+
 	if !c.session.IsEncrypted() {
 		return fmt.Errorf("not encrypted")
 	}
 
 	c.log("ending TLS session")
+
+	// 设置截止时间
+	deadline := mergeDeadline(ctx, c.config.Timeout)
+	if err := c.asyncConn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	if err := c.syncConn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	defer func() {
+		c.asyncConn.SetDeadline(time.Time{})
+		c.syncConn.SetDeadline(time.Time{})
+	}()
 
 	// 步骤 1：发送 AsyncEndTLS
 	if err := c.asyncConn.SendMessage(MsgAsyncEndTLS, 0, 0, nil); err != nil {
@@ -109,9 +140,12 @@ func (c *Client) EndTLS(ctx context.Context) error {
 	}
 
 	// 步骤 2：等待 AsyncEndTLSResponse
-	msg, err := c.asyncConn.ExpectMessage(MsgAsyncEndTLSResponse, c.config.Timeout)
+	msg, err := c.asyncConn.ReadMessage()
 	if err != nil {
 		return fmt.Errorf("wait AsyncEndTLSResponse: %w", err)
+	}
+	if msg.Header.MsgType != MsgAsyncEndTLSResponse {
+		return fmt.Errorf("expected AsyncEndTLSResponse, got %s", MsgTypeName(msg.Header.MsgType))
 	}
 
 	if msg.Header.Control != CtrlTLSSuccess {
@@ -148,15 +182,29 @@ func (c *Client) GetDescriptors(ctx context.Context) ([]byte, error) {
 	}
 	c.mu.RUnlock()
 
+	if c.session.Mode() == ModeOverlapped {
+		return nil, fmt.Errorf("GetDescriptors cannot be called in overlapped mode")
+	}
+
+	// 设置截止时间
+	deadline := mergeDeadline(ctx, c.config.Timeout)
+	if err := c.syncConn.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
+	defer c.syncConn.SetDeadline(time.Time{})
+
 	// 在同步通道上发送 GetDescriptors
 	if err := c.syncConn.SendMessage(MsgGetDescriptors, 0, 0, nil); err != nil {
 		return nil, fmt.Errorf("send GetDescriptors: %w", err)
 	}
 
 	// 等待响应
-	msg, err := c.syncConn.ExpectMessage(MsgGetDescriptorsResponse, c.config.Timeout)
+	msg, err := c.syncConn.ReadMessage()
 	if err != nil {
 		return nil, fmt.Errorf("wait GetDescriptorsResponse: %w", err)
+	}
+	if msg.Header.MsgType != MsgGetDescriptorsResponse {
+		return nil, fmt.Errorf("expected GetDescriptorsResponse, got %s", MsgTypeName(msg.Header.MsgType))
 	}
 
 	return msg.Payload, nil
@@ -180,6 +228,7 @@ func (c *Client) TLSConnectionState() *tls.ConnectionState {
 
 // GetSASLMechanisms 获取服务器支持的 SASL 认证机制列表。
 // 仅在 HiSLIP 2.0 或更高版本中可用。
+// 注意：此操作只能在同步模式下调用。在 overlapped 模式下会与 readLoopSync 竞争。
 func (c *Client) GetSASLMechanisms(ctx context.Context) ([]string, error) {
 	if !c.session.IsVersion2OrHigher() {
 		return nil, fmt.Errorf("SASL authentication requires HiSLIP 2.0 or higher")
@@ -192,15 +241,29 @@ func (c *Client) GetSASLMechanisms(ctx context.Context) ([]string, error) {
 	}
 	c.mu.RUnlock()
 
+	if c.session.Mode() == ModeOverlapped {
+		return nil, fmt.Errorf("GetSASLMechanisms cannot be called in overlapped mode")
+	}
+
+	// 设置截止时间
+	deadline := mergeDeadline(ctx, c.config.Timeout)
+	if err := c.syncConn.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
+	defer c.syncConn.SetDeadline(time.Time{})
+
 	// 发送 GetSaslMechanismList
 	if err := c.syncConn.SendMessage(MsgGetSaslMechanismList, 0, 0, nil); err != nil {
 		return nil, fmt.Errorf("send GetSaslMechanismList: %w", err)
 	}
 
 	// 等待响应
-	msg, err := c.syncConn.ExpectMessage(MsgGetSaslMechanismListResponse, c.config.Timeout)
+	msg, err := c.syncConn.ReadMessage()
 	if err != nil {
 		return nil, fmt.Errorf("wait GetSaslMechanismListResponse: %w", err)
+	}
+	if msg.Header.MsgType != MsgGetSaslMechanismListResponse {
+		return nil, fmt.Errorf("expected GetSaslMechanismListResponse, got %s", MsgTypeName(msg.Header.MsgType))
 	}
 
 	// 解析机制列表（以空格分隔的字符串）
@@ -246,7 +309,8 @@ func splitBySpace(s string) []string {
 
 // Authenticate 使用指定的 SASL 机制进行认证。
 // 仅在 HiSLIP 2.0 或更高版本中可用。
-// 注意：这是一个基础框架，具体的 SASL 机制实现需要根据需求添加。
+// 注意：这是一个基础框架，当前仅支持单步认证（如 PLAIN），
+// 不支持需要根据服务器 Challenge 动态计算响应的多步机制。
 func (c *Client) Authenticate(ctx context.Context, mechanism string, credentials []byte) error {
 	if !c.session.IsVersion2OrHigher() {
 		return fmt.Errorf("SASL authentication requires HiSLIP 2.0 or higher")
@@ -263,27 +327,52 @@ func (c *Client) Authenticate(ctx context.Context, mechanism string, credentials
 	}
 	c.mu.RUnlock()
 
+	if c.session.Mode() == ModeOverlapped {
+		return fmt.Errorf("Authenticate cannot be called in overlapped mode")
+	}
+
+	// 设置截止时间
+	deadline := mergeDeadline(ctx, c.config.Timeout)
+	if err := c.syncConn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	defer c.syncConn.SetDeadline(time.Time{})
+
 	// 发送 AuthenticationStart
-	// 控制码: 0
-	// 参数: 0
-	// 负载: 机制名称
 	if err := c.syncConn.SendMessage(MsgAuthenticationStart, 0, 0, []byte(mechanism)); err != nil {
 		return fmt.Errorf("send AuthenticationStart: %w", err)
 	}
 
+	credentialsSent := false
+
 	// 认证交换循环
 	for {
-		msg, err := c.syncConn.ReadWithTimeout(c.config.Timeout)
+		// 检查 Context 是否取消
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		msg, err := c.syncConn.ReadMessage()
 		if err != nil {
 			return fmt.Errorf("authentication exchange: %w", err)
 		}
 
 		switch msg.Header.MsgType {
 		case MsgAuthenticationExchange:
-			// 服务器请求更多数据，发送凭据
+			// 如果服务器请求更多数据
+			if credentialsSent {
+				// 我们已经发送过凭据了。由于 API 限制，无法生成新的响应。
+				// 对于 PLAIN 机制，这通常意味着错误。
+				return fmt.Errorf("multi-step authentication not supported by this client API")
+			}
+
+			// 发送凭据
 			if err := c.syncConn.SendMessage(MsgAuthenticationExchange, 0, 0, credentials); err != nil {
 				return fmt.Errorf("send AuthenticationExchange: %w", err)
 			}
+			credentialsSent = true
 
 		case MsgAuthenticationResult:
 			switch msg.Header.Control {
@@ -292,7 +381,8 @@ func (c *Client) Authenticate(ctx context.Context, mechanism string, credentials
 			case CtrlAuthFail:
 				return ErrAuthFailed
 			case CtrlAuthContinue:
-				// 继续认证流程
+				// 服务器可能在成功前发送最后一步数据
+				// 继续循环以等待最终结果或更多交换
 				continue
 			default:
 				return fmt.Errorf("unexpected authentication result: ctrl=%d", msg.Header.Control)
