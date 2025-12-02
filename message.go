@@ -121,6 +121,11 @@ func ReadMessage(r io.Reader) (*Message, error) {
 		return nil, err
 	}
 
+	// 全局安全上限，避免在协议或对端错误时分配过大的缓冲区。
+	if h.Length > DefaultMaxMessageSize {
+		return nil, fmt.Errorf("%w: received %d bytes, max %d", ErrMessageTooLarge, h.Length, DefaultMaxMessageSize)
+	}
+
 	var payload []byte
 	if h.Length > 0 {
 		payload = make([]byte, h.Length)

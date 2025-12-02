@@ -2,6 +2,7 @@ package gohislip
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 )
 
@@ -176,5 +177,24 @@ func TestReadHeader_InvalidPrologue(t *testing.T) {
 	_, err := ReadHeader(buf)
 	if err == nil {
 		t.Error("expected error for invalid prologue")
+	}
+}
+
+func TestReadMessage_TooLarge(t *testing.T) {
+	// 构造一个 header，其 Length 大于全局默认最大值，验证 ReadMessage 直接报 ErrMessageTooLarge
+	msg := NewMessage(MsgDataEnd, 0, 0, nil)
+	msg.Header.Length = DefaultMaxMessageSize + 1
+
+	var buf bytes.Buffer
+	if err := WriteMessage(&buf, msg); err != nil {
+		t.Fatalf("WriteMessage failed: %v", err)
+	}
+
+	_, err := ReadMessage(&buf)
+	if err == nil {
+		t.Fatalf("expected error for over-sized message")
+	}
+	if !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("err = %v, want ErrMessageTooLarge", err)
 	}
 }

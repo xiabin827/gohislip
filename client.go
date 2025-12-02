@@ -47,8 +47,9 @@ type Client struct {
 	syncConn  *Conn // 同步通道
 	asyncConn *Conn // 异步通道
 
-	session *Session
-	tracker *QueryTracker
+	session  *Session
+	tracker  *QueryTracker // 同步通道（overlapped 查询）
+	atracker *AsyncTracker // 异步通道请求/响应
 
 	config *ClientConfig
 
@@ -56,9 +57,8 @@ type Client struct {
 	syncDone  chan struct{}
 	asyncDone chan struct{}
 
-	// 响应通道
-	syncResp  chan *Message
-	asyncResp chan *Message
+	// 同步通道响应（overlapped 模式）
+	syncResp chan *Message
 
 	// 专用操作通道
 	deviceClearAck chan struct{} // DeviceClear 异步确认
@@ -72,7 +72,8 @@ type Client struct {
 	closed bool
 
 	// 用于同步模式查询处理
-	queryMu sync.Mutex
+	queryMu          sync.Mutex
+	readLoopsStarted bool // 读取循环是否已启动（用于 StartTLS 路径区分）
 }
 
 // NewClient 创建新的 HiSLIP 客户端，但尚未连接。
@@ -83,11 +84,11 @@ func NewClient(config *ClientConfig) *Client {
 	return &Client{
 		session:        NewSession(),
 		tracker:        NewQueryTracker(),
+		atracker:       NewAsyncTracker(),
 		config:         config,
 		syncDone:       make(chan struct{}),
 		asyncDone:      make(chan struct{}),
 		syncResp:       make(chan *Message, 16),
-		asyncResp:      make(chan *Message, 16),
 		deviceClearAck: make(chan struct{}, 1),
 	}
 }
@@ -190,6 +191,7 @@ func (c *Client) Connect(ctx context.Context, address string) error {
 		go c.readLoopSync()
 	}
 	go c.readLoopAsync()
+	c.readLoopsStarted = true
 
 	c.log("connected, session ID: %d, version: %d.%d",
 		c.session.SessionID(),
@@ -330,12 +332,12 @@ func (c *Client) negotiateMaxMessageSize() error {
 	maxSize := DefaultMaxMessageSize
 	payload := encodeUint64(maxSize)
 
-	// 根据规范: control=0, param=0, payload 包含完整的 64 位值
+	// 根据规范: control=0, param=0, payload 包含完整的 64 位值。
+	// 由于此时尚未启动异步读取循环，仍可直接在 asyncConn 上发送并等待响应。
 	if err := c.asyncConn.SendMessage(MsgAsyncMaximumMessageSize, 0, 0, payload); err != nil {
 		return err
 	}
 
-	// 接收响应
 	resp, err := c.asyncConn.ExpectMessage(MsgAsyncMaximumMessageSizeResp, c.config.Timeout)
 	if err != nil {
 		return err
@@ -656,29 +658,43 @@ func (c *Client) Lock(ctx context.Context, timeout time.Duration) error {
 
 	// 发送 AsyncLock 请求
 	timeoutMs := uint32(timeout / time.Millisecond)
+	ch, err := c.atracker.Register(MsgAsyncLockResponse)
+	if err != nil {
+		return fmt.Errorf("lock already in progress: %w", err)
+	}
+
 	if err := c.asyncConn.SendMessage(MsgAsyncLock, CtrlLockRequest, timeoutMs, nil); err != nil {
+		c.atracker.Cancel(MsgAsyncLockResponse, err)
 		return err
 	}
 
 	c.log("Lock requested: timeout=%v", timeout)
 
-	// Wait for response
-	msg, err := c.asyncConn.ExpectMessage(MsgAsyncLockResponse, timeout+time.Second)
-	if err != nil {
-		return err
-	}
-
-	switch msg.Header.Control {
-	case CtrlLockSuccess:
-		c.session.SetLockState(LockExclusive)
-		c.log("Lock acquired")
-		return nil
-	case CtrlLockFail:
-		return ErrLockTimeout
-	case CtrlLockError:
-		return ErrLockFailed
-	default:
-		return fmt.Errorf("unexpected lock response: ctrl=%d", msg.Header.Control)
+	waitTimeout := timeout + time.Second
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			return res.err
+		}
+		msg := res.msg
+		switch msg.Header.Control {
+		case CtrlLockSuccess:
+			c.session.SetLockState(LockExclusive)
+			c.log("Lock acquired")
+			return nil
+		case CtrlLockFail:
+			return ErrLockTimeout
+		case CtrlLockError:
+			return ErrLockFailed
+		default:
+			return fmt.Errorf("unexpected lock response: ctrl=%d", msg.Header.Control)
+		}
+	case <-time.After(waitTimeout):
+		c.atracker.Cancel(MsgAsyncLockResponse, ErrTimeout)
+		return ErrTimeout
+	case <-ctx.Done():
+		c.atracker.Cancel(MsgAsyncLockResponse, ctx.Err())
+		return ctx.Err()
 	}
 }
 
@@ -702,25 +718,37 @@ func (c *Client) Unlock(ctx context.Context) error {
 		lastID = MessageIDClear
 	}
 
+	ch, err := c.atracker.Register(MsgAsyncLockResponse)
+	if err != nil {
+		return fmt.Errorf("unlock already in progress: %w", err)
+	}
+
 	if err := c.asyncConn.SendMessage(MsgAsyncLock, CtrlLockRelease, lastID, nil); err != nil {
+		c.atracker.Cancel(MsgAsyncLockResponse, err)
 		return err
 	}
 
 	c.log("Unlock requested: lastID=0x%08x", lastID)
 
-	// Wait for response
-	msg, err := c.asyncConn.ExpectMessage(MsgAsyncLockResponse, c.config.Timeout)
-	if err != nil {
-		return err
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			return res.err
+		}
+		msg := res.msg
+		if msg.Header.Control == CtrlLockSuccess || msg.Header.Control == CtrlLockFail {
+			c.session.SetLockState(LockNone)
+			c.log("Lock released")
+			return nil
+		}
+		return fmt.Errorf("unexpected unlock response: ctrl=%d", msg.Header.Control)
+	case <-time.After(c.config.Timeout):
+		c.atracker.Cancel(MsgAsyncLockResponse, ErrTimeout)
+		return ErrTimeout
+	case <-ctx.Done():
+		c.atracker.Cancel(MsgAsyncLockResponse, ctx.Err())
+		return ctx.Err()
 	}
-
-	if msg.Header.Control == CtrlLockSuccess || msg.Header.Control == CtrlLockFail {
-		c.session.SetLockState(LockNone)
-		c.log("Lock released")
-		return nil
-	}
-
-	return fmt.Errorf("unexpected unlock response: ctrl=%d", msg.Header.Control)
 }
 
 // Status 从仪器查询状态字节。
@@ -741,18 +769,31 @@ func (c *Client) Status(ctx context.Context) (byte, error) {
 	// 控制位 0: RMT-delivered
 	ctrl := uint8(CtrlRMTDelivered)
 
-	if err := c.asyncConn.SendMessage(MsgAsyncStatusQuery, ctrl, lastID, nil); err != nil {
-		return 0, err
-	}
-
-	msg, err := c.asyncConn.ExpectMessage(MsgAsyncStatusResponse, c.config.Timeout)
+	ch, err := c.atracker.Register(MsgAsyncStatusResponse)
 	if err != nil {
+		return 0, fmt.Errorf("status query already in progress: %w", err)
+	}
+
+	if err := c.asyncConn.SendMessage(MsgAsyncStatusQuery, ctrl, lastID, nil); err != nil {
+		c.atracker.Cancel(MsgAsyncStatusResponse, err)
 		return 0, err
 	}
 
-	stb := msg.Header.Control
-	c.log("Status: STB=0x%02x", stb)
-	return stb, nil
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			return 0, res.err
+		}
+		stb := res.msg.Header.Control
+		c.log("Status: STB=0x%02x", stb)
+		return stb, nil
+	case <-time.After(c.config.Timeout):
+		c.atracker.Cancel(MsgAsyncStatusResponse, ErrTimeout)
+		return 0, ErrTimeout
+	case <-ctx.Done():
+		c.atracker.Cancel(MsgAsyncStatusResponse, ctx.Err())
+		return 0, ctx.Err()
+	}
 }
 
 // DeviceClear 执行设备清除操作。
@@ -917,12 +958,23 @@ func (c *Client) RemoteLocal(mode uint8) error {
 	}
 	c.mu.RUnlock()
 
+	ch, err := c.atracker.Register(MsgAsyncRemoteLocalResponse)
+	if err != nil {
+		return fmt.Errorf("remote/local operation already in progress: %w", err)
+	}
+
 	if err := c.asyncConn.SendMessage(MsgAsyncRemoteLocalControl, mode, 0, nil); err != nil {
+		c.atracker.Cancel(MsgAsyncRemoteLocalResponse, err)
 		return err
 	}
 
-	_, err := c.asyncConn.ExpectMessage(MsgAsyncRemoteLocalResponse, c.config.Timeout)
-	return err
+	select {
+	case res := <-ch:
+		return res.err
+	case <-time.After(c.config.Timeout):
+		c.atracker.Cancel(MsgAsyncRemoteLocalResponse, ErrTimeout)
+		return ErrTimeout
+	}
 }
 
 // SetSRQCallback 设置服务请求通知的回调。
@@ -979,6 +1031,8 @@ func (c *Client) readLoopAsync() {
 			} else {
 				c.log("async read error: %v", err)
 			}
+			// 通知所有等待异步结果的操作
+			c.atracker.Fail(err)
 			return
 		}
 
@@ -1058,10 +1112,11 @@ func (c *Client) dispatchAsync(msg *Message) {
 	case MsgAsyncInterrupted:
 		c.log("AsyncInterrupted received")
 		c.tracker.Clear(ErrInterrupted)
+		c.atracker.Fail(ErrInterrupted)
 
 	case MsgAsyncDeviceClear:
-		// AsyncDeviceClearAcknowledge - 通知等待的 DeviceClear
-		c.log("AsyncDeviceClearAcknowledge received via dispatch")
+		// 服务器用 AsyncDeviceClear 消息响应客户端的 AsyncDeviceClear 请求（规范 5.2）
+		c.log("AsyncDeviceClear response received")
 		select {
 		case c.deviceClearAck <- struct{}{}:
 		default:
@@ -1072,18 +1127,19 @@ func (c *Client) dispatchAsync(msg *Message) {
 		err := NewFatalError(msg.Header.Control, msg.Payload)
 		c.log("FatalError: %v", err)
 		c.tracker.Clear(err)
+		c.atracker.Fail(err)
 		c.Close()
 
 	case MsgError:
 		err := NewNonFatalError(msg.Header.Control, msg.Payload)
 		c.log("Error: %v", err)
+		// 无法精确关联到具体操作，只能让所有等待的异步操作失败
+		c.atracker.Fail(err)
 
 	default:
-		// 路由到异步响应通道以进行特定操作
-		select {
-		case c.asyncResp <- msg:
-		default:
-			c.log("async response channel full, discarding: %s", MsgTypeName(msg.Header.MsgType))
+		// 尝试投递给等待该类型响应的异步操作
+		if !c.atracker.Complete(msg) {
+			c.log("unhandled async message: %s", MsgTypeName(msg.Header.MsgType))
 		}
 	}
 }
@@ -1092,19 +1148,55 @@ func (c *Client) dispatchAsync(msg *Message) {
 func (c *Client) establishSecureConnection(ctx context.Context) error {
 	c.log("establishing secure connection")
 
-	// 步骤 1：发送 AsyncStartTLS
-	if err := c.asyncConn.SendMessage(MsgAsyncStartTLS, 0, 0, nil); err != nil {
-		return fmt.Errorf("send AsyncStartTLS: %w", err)
-	}
+	// 在 Connect 期间尚未启动异步读取循环，可以直接在 asyncConn 上等待响应。
+	if !c.readLoopsStarted {
+		// 步骤 1：发送 AsyncStartTLS
+		if err := c.asyncConn.SendMessage(MsgAsyncStartTLS, 0, 0, nil); err != nil {
+			return fmt.Errorf("send AsyncStartTLS: %w", err)
+		}
 
-	// 步骤 2：等待 AsyncStartTLSResponse
-	msg, err := c.asyncConn.ExpectMessage(MsgAsyncStartTLSResponse, c.config.Timeout)
-	if err != nil {
-		return fmt.Errorf("wait AsyncStartTLSResponse: %w", err)
-	}
+		// 步骤 2：等待 AsyncStartTLSResponse
+		msg, err := c.asyncConn.ExpectMessage(MsgAsyncStartTLSResponse, c.config.Timeout)
+		if err != nil {
+			return fmt.Errorf("wait AsyncStartTLSResponse: %w", err)
+		}
+		if msg.Header.Control != CtrlTLSSuccess {
+			return fmt.Errorf("server rejected TLS: ctrl=%d", msg.Header.Control)
+		}
+	} else {
+		// 连接建立后，异步读取循环已启动，必须通过 AsyncTracker 协调响应。
+		ch, err := c.atracker.Register(MsgAsyncStartTLSResponse)
+		if err != nil {
+			return fmt.Errorf("register AsyncStartTLSResponse waiter: %w", err)
+		}
 
-	if msg.Header.Control != CtrlTLSSuccess {
-		return fmt.Errorf("server rejected TLS: ctrl=%d", msg.Header.Control)
+		if err := c.asyncConn.SendMessage(MsgAsyncStartTLS, 0, 0, nil); err != nil {
+			c.atracker.Cancel(MsgAsyncStartTLSResponse, err)
+			return fmt.Errorf("send AsyncStartTLS: %w", err)
+		}
+
+		deadline := mergeDeadline(ctx, c.config.Timeout)
+		timeout := time.Until(deadline)
+		if timeout <= 0 {
+			c.atracker.Cancel(MsgAsyncStartTLSResponse, ErrTimeout)
+			return ErrTimeout
+		}
+
+		select {
+		case res := <-ch:
+			if res.err != nil {
+				return fmt.Errorf("wait AsyncStartTLSResponse: %w", res.err)
+			}
+			if res.msg.Header.Control != CtrlTLSSuccess {
+				return fmt.Errorf("server rejected TLS: ctrl=%d", res.msg.Header.Control)
+			}
+		case <-time.After(timeout):
+			c.atracker.Cancel(MsgAsyncStartTLSResponse, ErrTimeout)
+			return ErrTimeout
+		case <-ctx.Done():
+			c.atracker.Cancel(MsgAsyncStartTLSResponse, ctx.Err())
+			return ctx.Err()
+		}
 	}
 
 	// 步骤 3：将异步连接升级为 TLS

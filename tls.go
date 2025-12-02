@@ -109,67 +109,10 @@ func (c *Client) StartTLS(ctx context.Context) error {
 }
 
 // EndTLS 从 TLS 降级为非加密连接。
-// 很少使用但在 HiSLIP 2.0 中有规定。
+// 由于 Go 标准库无法在不关闭底层 TCP 连接的情况下“解包” tls.Conn，
+// 本客户端不支持在现有会话上执行 EndTLS；如需切换为非加密，请关闭连接后重新 Dial。
 func (c *Client) EndTLS(ctx context.Context) error {
-	if c.session.Mode() == ModeOverlapped {
-		return fmt.Errorf("EndTLS cannot be called in overlapped mode")
-	}
-
-	if !c.session.IsEncrypted() {
-		return fmt.Errorf("not encrypted")
-	}
-
-	c.log("ending TLS session")
-
-	// 设置截止时间
-	deadline := mergeDeadline(ctx, c.config.Timeout)
-	if err := c.asyncConn.SetDeadline(deadline); err != nil {
-		return err
-	}
-	if err := c.syncConn.SetDeadline(deadline); err != nil {
-		return err
-	}
-	defer func() {
-		c.asyncConn.SetDeadline(time.Time{})
-		c.syncConn.SetDeadline(time.Time{})
-	}()
-
-	// 步骤 1：发送 AsyncEndTLS
-	if err := c.asyncConn.SendMessage(MsgAsyncEndTLS, 0, 0, nil); err != nil {
-		return fmt.Errorf("send AsyncEndTLS: %w", err)
-	}
-
-	// 步骤 2：等待 AsyncEndTLSResponse
-	msg, err := c.asyncConn.ReadMessage()
-	if err != nil {
-		return fmt.Errorf("wait AsyncEndTLSResponse: %w", err)
-	}
-	if msg.Header.MsgType != MsgAsyncEndTLSResponse {
-		return fmt.Errorf("expected AsyncEndTLSResponse, got %s", MsgTypeName(msg.Header.MsgType))
-	}
-
-	if msg.Header.Control != CtrlTLSSuccess {
-		return fmt.Errorf("server rejected EndTLS: ctrl=%d", msg.Header.Control)
-	}
-
-	// 步骤 3：降级异步连接
-	if err := c.asyncConn.DowngradeFromTLS(); err != nil {
-		return fmt.Errorf("async TLS downgrade: %w", err)
-	}
-
-	// 步骤 4：在同步通道上发送 EndTLS
-	if err := c.syncConn.SendMessage(MsgEndTLS, 0, 0, nil); err != nil {
-		return fmt.Errorf("send EndTLS: %w", err)
-	}
-
-	// 步骤 5：降级同步连接
-	if err := c.syncConn.DowngradeFromTLS(); err != nil {
-		return fmt.Errorf("sync TLS downgrade: %w", err)
-	}
-
-	c.session.SetEncrypted(false)
-	c.log("TLS session ended")
-	return nil
+	return fmt.Errorf("EndTLS is not supported by this client; close the connection and reconnect without TLS instead")
 }
 
 // GetDescriptors 获取服务器能力描述符（HiSLIP 2.0）。

@@ -116,20 +116,10 @@ func (c *Conn) DowngradeFromTLS() error {
 		return nil
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// 关闭 TLS 层（发送 close_notify）
-	if err := c.tlsConn.Close(); err != nil {
-		return fmt.Errorf("TLS close: %w", err)
-	}
-
-	// 注意：实际上降级很复杂且很少实现。
-	// TLS 关闭后底层 TCP 连接可能无法重用。
-	c.isTLS = false
-	c.tlsConn = nil
-
-	return nil
+	// Go 标准库不支持从 tls.Conn 中“降级”回原始 TCP 连接；
+	// 一旦关闭 TLS，底层连接也会被关闭。因此这里明确返回不支持，
+	// 调用方应主动关闭连接并重新建立非 TLS 会话。
+	return fmt.Errorf("DowngradeFromTLS is not supported; close and reconnect without TLS instead")
 }
 
 // ReadMessage 从连接读取一条完整的 HiSLIP 消息。
