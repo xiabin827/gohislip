@@ -264,12 +264,23 @@ func (c *Client) recvInitializeResponse() error {
 		return err
 	}
 
-	// 从负载解析版本
-	if len(msg.Payload) < 2 {
-		return fmt.Errorf("InitializeResponse payload too short")
+	var major, minor uint8
+	var encMode uint8
+
+	if len(msg.Payload) >= 2 {
+		// HiSLIP 2.0: 版本信息在 Payload 中 (2 字节)
+		// Param 格式: [overlap(1) | reserved(7) | encryption_mode(8) | session_id(16)]
+		version := uint16(msg.Payload[0])<<8 | uint16(msg.Payload[1])
+		major, minor = ParseVersion(version)
+		_, encMode, _ = ParseInitializeResponseParam(msg.Header.Param)
+	} else {
+		// HiSLIP 1.0: 版本信息在 Param 中，Payload 为空
+		// Param 格式: [overlap(1) | reserved(7) | server_protocol_version(8) | session_id(16)]
+		// server_protocol_version 仅包含次版本号，主版本号隐含为 1
+		minor = uint8((msg.Header.Param >> 16) & 0xFF)
+		major = 1
+		encMode = EncryptionModeNone
 	}
-	version := uint16(msg.Payload[0])<<8 | uint16(msg.Payload[1])
-	major, minor := ParseVersion(version)
 	c.session.SetServerVersion(major, minor)
 
 	// 协议版本兼容性检查
@@ -278,8 +289,9 @@ func (c *Client) recvInitializeResponse() error {
 		return fmt.Errorf("unsupported protocol version %d.%d (minimum 1.0)", major, minor)
 	}
 
-	// 解析参数: overlap | encryption_mode | session_id
-	overlap, encMode, sessionID := ParseInitializeResponseParam(msg.Header.Param)
+	// 解析公共参数: overlap 和 session_id
+	overlap := (msg.Header.Param >> 24 & 0x01) != 0
+	sessionID := uint16(msg.Header.Param & 0xFFFF)
 	c.session.SetSessionID(sessionID)
 	c.session.SetSupportsOverlap(overlap)
 	c.session.SetEncryptionMode(encMode)
